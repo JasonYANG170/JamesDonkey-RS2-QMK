@@ -1,0 +1,94 @@
+name: Build RS2 3.0 firmware
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build VIA firmware
+    runs-on: ubuntu-22.04
+    timeout-minutes: 25
+    outputs:
+      version: ${{ steps.package.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git make gcc gcc-arm-none-eabi libnewlib-arm-none-eabi libhidapi-hidraw0 python3-venv
+      - name: Compile and verify firmware
+        run: bash scripts/build.sh via
+      - name: Package firmware and VIA layout
+        id: package
+        shell: bash
+        run: |
+          board=keyboards/jamesdonkey/rs2_30/reference/keyboard.json
+          version="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["usb"]["device_version"])' "$board")"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid firmware version: $version" >&2
+            exit 1
+          fi
+
+          name="RS2-VIA-$version"
+          test "$(stat -c %s dist/RS2-via.bin)" -eq 262144
+          mkdir -p dist/release
+          cp dist/RS2-via.bin "dist/release/$name.bin"
+          cp dist/RS2-VIA.json "dist/release/$name.json"
+          cd dist/release
+          sha256sum "$name.bin" "$name.json" > SHA256SUMS
+          sha256sum -c SHA256SUMS
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: RS2-VIA
+          path: dist/release/
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    concurrency:
+      group: rs2-release-${{ github.sha }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: RS2-VIA
+          path: release
+      - name: Publish firmware and VIA layout
+        working-directory: release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          FIRMWARE_VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          sha256sum -c SHA256SUMS
+          build_date=$(date -u +%Y%m%d)
+          tag="build-${build_date}-${GITHUB_SHA:0:7}"
+          name="RS2-VIA-$FIRMWARE_VERSION"
+          assets=("$name.bin" "$name.json" SHA256SUMS)
+          if draft="$(gh release view "$tag" --json isDraft --jq .isDraft 2>/dev/null)"; then
+            if [[ "$draft" == true ]]; then
+              gh release upload "$tag" "${assets[@]}" --clobber
+              gh release edit "$tag" --draft=false
+            else
+              echo "Release $tag is already published."
+            fi
+          else
+            gh release create "$tag" "${assets[@]}" --target "$GITHUB_SHA" \
+              --title "RS2 3.0 QMK $build_date" --generate-notes
+          fi
